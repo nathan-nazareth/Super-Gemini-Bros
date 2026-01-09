@@ -1,0 +1,5 @@
+{
+  "name": "Copy of Super Gemini Bros",
+  "description": "A classic 2D platformer clone powered by Gemini. Features platforming physics, enemies, and power-ups. Includes a built-in AI DevTools suite to generate assets, edit the game view with text prompts, and get gameplay tips using Google Search grounding.",
+  "requestFramePermissions": []
+}
