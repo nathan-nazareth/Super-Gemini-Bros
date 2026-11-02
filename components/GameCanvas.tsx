@@ -1,10 +1,18 @@
 import React, { useEffect, useRef, useState, forwardRef, useImperativeHandle } from 'react';
-import { Entity, GameState, Tile, Vector } from '../types';
-import { 
-  TILE_SIZE, GRAVITY, FRICTION, MOVE_ACCEL, RUN_ACCEL, MAX_SPEED, 
+import { Entity, EntityType, GameState, PlayerAbility, Tile, Vector } from '../types';
+import {
+  TILE_SIZE, GRAVITY, FRICTION, MOVE_ACCEL, RUN_ACCEL, MAX_SPEED,
   MAX_RUN_SPEED, JUMP_FORCE, BOUNCE_FORCE, SCREEN_WIDTH, SCREEN_HEIGHT,
-  GENERATION_BUFFER, CHUNK_SIZE 
+  GENERATION_BUFFER, CHUNK_SIZE, ABILITY_DURATIONS, MEGA_DURATION,
+  JETPACK_FUEL_MAX, JETPACK_FUEL_BURN, JETPACK_FUEL_REFILL, JETPACK_THRUST,
+  MAGNET_RADIUS, MAGNET_PULL, SLOWMO_FACTOR, SLOWMO_MULTIPLIER,
+  STOMP_CHAIN, COINS_PER_LIFE, MOVER_ITEMS, STATIC_ITEMS, BLOCK_ITEMS,
+  TANOOKI_JUMP_FORCE, SPRING_JUMP_FORCE, SPRING_BOUNCE, SPRING_BOUNCE_MIN_FALL,
+  BOOMERANG_SPEED, BOOMERANG_RANGE, GOLD_COIN_COUNT, GOLD_COIN_VALUE,
+  GOLD_MUSHROOM_SCORE, THEMES
 } from '../constants';
+import { itemSprite } from '../sprites';
+import { audio } from '../audio';
 
 interface GameCanvasProps {
   onGameOver: (score: number) => void;
@@ -18,6 +26,50 @@ export interface GameCanvasHandle {
 // Helper to determine solidity
 const isSolid = (type: Tile['type']) => {
   return ['ground', 'brick', 'question', 'hard', 'pipe_l', 'pipe_r', 'pipe_top_l', 'pipe_top_r', 'castle_brick', 'castle_top'].includes(type);
+};
+
+/** Everything the player can pick up and turn into a power-up. */
+const COLLECTIBLE_TYPES: Record<string, true> = {
+  mushroom: true, '1up': true, gold_mushroom: true, mega_mushroom: true,
+  flower: true, ice_flower: true, boomerang_flower: true, tanooki: true,
+  jetpack: true, magnet: true, hourglass: true, spring: true, star: true,
+};
+
+/** Enemies: they stomp, they get kicked, they feed the combo chain. */
+const ENEMY_TYPES: Record<string, true> = {
+  goomba: true, big_goomba: true, koopa: true, koopa_red: true, spiny: true,
+};
+
+/** Entities that are blitted from the sprite cache instead of drawn by hand. */
+const SPRITE_TYPES: Record<string, true> = {
+  ...COLLECTIBLE_TYPES,
+  coin: true,
+  boomerang: true,
+  fireball: true,
+  iceball: true,
+};
+
+/** Display names for the power-ups the player can carry. */
+const ABILITY_LABELS: Record<string, string> = {
+  tanooki: 'Tanooki',
+  boomerang: 'Boomerang',
+  jetpack: 'Jetpack',
+  magnet: 'Magnet',
+  slowmo: 'Slow-Mo',
+  spring: 'Spring',
+};
+
+/** Picks what a ? block holds, weighted by BLOCK_ITEMS. */
+const pickBlockItem = (): Tile['content'] => {
+  let total = 0;
+  for (const entry of BLOCK_ITEMS) total += entry.weight;
+
+  let roll = Math.random() * total;
+  for (const entry of BLOCK_ITEMS) {
+    roll -= entry.weight;
+    if (roll <= 0) return entry.item;
+  }
+  return 'coin';
 };
 
 // Decoration Types
@@ -44,7 +96,12 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
     animTimer: 0,
     frame: 0,
     invulnerableUntil: 0,
-    starTimer: 0
+    starTimer: 0,
+    ability: null,
+    abilityTimer: 0,
+    fuel: JETPACK_FUEL_MAX,
+    jumpsLeft: 0,
+    megaTimer: 0
   });
 
   const lastSafePosRef = useRef<Vector>({ x: 100, y: 100 });
@@ -73,7 +130,17 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
     gameOver: false,
     paused: false,
     cameraX: 0,
-    won: false
+    won: false,
+    combo: 0,
+    ability: null,
+    abilityTimer: 0,
+    starTimer: 0,
+    megaTimer: 0,
+    fuel: JETPACK_FUEL_MAX,
+    muted: false,
+    hurry: false,
+    theme: 0,
+    buffs: {}
   });
 
   const keysRef = useRef<{ [key: string]: boolean }>({});
@@ -137,6 +204,12 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
     p.isDead = false;
     p.invulnerableUntil = 0;
     p.starTimer = 0;
+    p.ability = null;
+    p.abilityTimer = 0;
+    p.fuel = JETPACK_FUEL_MAX;
+    p.jumpsLeft = 0;
+    p.megaTimer = 0;
+    p.prevState = undefined;
     
     lastSafePosRef.current = { x: 100, y: 100 };
 
@@ -144,6 +217,15 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
     stateRef.current.won = false;
     stateRef.current.cameraX = 0;
     stateRef.current.time = 400; // Reset timer
+    stateRef.current.combo = 0;
+    stateRef.current.ability = null;
+    stateRef.current.abilityTimer = 0;
+    stateRef.current.starTimer = 0;
+    stateRef.current.megaTimer = 0;
+    stateRef.current.fuel = JETPACK_FUEL_MAX;
+    stateRef.current.buffs = {};
+    stateRef.current.theme = (lvl - 1) % THEMES.length;
+    audio.setTheme(stateRef.current.theme);
 
     // Generate initial floor to stand on
     generateChunk(20, true);
@@ -216,13 +298,7 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
                    if (Math.random() < 0.3) tilesRef.current.push({ x: tx, y: by - TILE_SIZE, type: 'brick', solid: true });
                 } else {
                    // Question blocks
-                   let content: Tile['content'] = 'coin';
-                   const r = Math.random();
-                   if (r > 0.96) content = '1up';
-                   else if (r > 0.92) content = 'star';
-                   else if (r > 0.85) content = 'ice_flower';
-                   else if (r > 0.75) content = 'flower';
-                   else if (r > 0.60) content = 'mushroom';
+                   const content = pickBlockItem();
 
                    tilesRef.current.push({ x: tx, y: by, type: 'question', content, solid: true });
                 }
@@ -358,12 +434,26 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
 
   const handleKeyDown = (e: KeyboardEvent) => { 
       keysRef.current[e.code] = true; 
-      
-      const isFire = playerRef.current.state === 'fire';
-      const isIce = playerRef.current.state === 'ice';
-      
-      if ((e.code === 'KeyX' || e.code === 'ShiftLeft') && (isFire || isIce) && !e.repeat && !stateRef.current.won) {
-         spawnProjectile(isIce ? 'iceball' : 'fireball');
+
+      // Audio can only start once the player has interacted with the page.
+      audio.init();
+      audio.resume();
+
+      if (e.code === 'KeyM' && !e.repeat) {
+         stateRef.current.muted = audio.toggleMute();
+         return;
+      }
+
+      const p = playerRef.current;
+      const isFire = p.state === 'fire';
+      const isIce = p.state === 'ice';
+
+      if ((e.code === 'KeyX' || e.code === 'ShiftLeft') && !e.repeat && !stateRef.current.won) {
+         if (p.ability === 'boomerang') {
+            throwBoomerang();
+         } else if (isFire || isIce) {
+            spawnProjectile(isIce ? 'iceball' : 'fireball');
+         }
       }
   };
   const handleKeyUp = (e: KeyboardEvent) => { keysRef.current[e.code] = false; };
@@ -372,6 +462,7 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
       const p = playerRef.current;
       const count = entitiesRef.current.filter(e => e.type === type).length;
       if (count >= 2) return;
+      audio[type === 'iceball' ? 'freeze' : 'fireball']();
 
       entitiesRef.current.push({
           id: `${type}_${Date.now()}`,
@@ -381,6 +472,111 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
           width: 16, height: 16,
           animTimer: 0
       });
+  };
+
+  // --- Power-up helpers -------------------------------------------------------
+
+  /** Adds points, doubled while slow motion is running. */
+  const addScore = (points: number) => {
+      const mult = stateRef.current.buffs.slowmo ? SLOWMO_MULTIPLIER : 1;
+      stateRef.current.score += points * mult;
+  };
+
+  /** Switches the player between forms, keeping their feet on the ground. */
+  const setPlayerForm = (p: Entity, form: string) => {
+      const prevHeight = p.height;
+      p.state = form;
+      if (form === 'small') { p.width = 24; p.height = 32; }
+      else if (form === 'mega') { p.width = 30; p.height = 64; }
+      else { p.width = 24; p.height = 50; } // big / fire / ice
+      p.pos.y += prevHeight - p.height;
+  };
+
+  /** Gives the player a power-up, replacing whatever they were carrying. */
+  const grantAbility = (p: Entity, ability: PlayerAbility) => {
+      if (p.ability === 'slowmo') delete stateRef.current.buffs.slowmo;
+      p.ability = ability;
+      p.abilityTimer = ABILITY_DURATIONS[ability] ?? 0; // 0 => lasts until damaged
+      if (ability === 'tanooki') p.jumpsLeft = 1;
+      if (ability === 'jetpack') p.fuel = JETPACK_FUEL_MAX;
+      if (ability === 'slowmo') stateRef.current.buffs.slowmo = ABILITY_DURATIONS.slowmo;
+      stateRef.current.ability = ability;
+      stateRef.current.abilityTimer = p.abilityTimer;
+  };
+
+  /** Drops the carried power-up when it runs out or the player gets hit. */
+  const expireAbility = (p: Entity) => {
+      if (p.ability === 'slowmo') delete stateRef.current.buffs.slowmo;
+      p.ability = null;
+      p.abilityTimer = 0;
+      stateRef.current.ability = null;
+      stateRef.current.abilityTimer = 0;
+  };
+
+  /** Puts the player into the temporary mega form. */
+  const startMegaForm = (p: Entity) => {
+      p.prevState = p.state;
+      setPlayerForm(p, 'mega');
+      p.megaTimer = MEGA_DURATION;
+      audio.mega();
+  };
+
+  /** Reverts the mega form back to the form the player had before it. */
+  const endMegaForm = (p: Entity) => {
+      if (p.state !== 'mega') return;
+      setPlayerForm(p, p.prevState ?? 'small');
+      p.prevState = undefined;
+      p.megaTimer = 0;
+  };
+
+  /** Throws the boomerang the boomerang flower grants. */
+  const throwBoomerang = () => {
+      const p = playerRef.current;
+      if (entitiesRef.current.some(e => e.type === 'boomerang')) return;
+
+      entitiesRef.current.push({
+          id: `boomerang_${Date.now()}`,
+          type: 'boomerang',
+          pos: { x: p.pos.x + (p.facing === 1 ? p.width : -12), y: p.pos.y + 10 },
+          vel: { x: (p.facing || 1) * BOOMERANG_SPEED, y: 0 },
+          width: 26, height: 26,
+          animTimer: 0,
+          frame: 0,
+          returning: false,
+          age: 0
+      });
+      audio.boomerang();
+  };
+
+  /** Releases a shower of coins - the gold mushroom's payoff. */
+  const spawnCoinShower = (x: number, y: number) => {
+      for (let i = 0; i < GOLD_COIN_COUNT; i++) {
+          const spread = (i - (GOLD_COIN_COUNT - 1) / 2) / ((GOLD_COIN_COUNT - 1) / 2);
+          entitiesRef.current.push({
+              id: `coin_${Date.now()}_${i}`,
+              type: 'coin',
+              pos: { x: x + spread * 26, y },
+              vel: { x: spread * 3.5, y: -8 },
+              width: 24, height: 26,
+              animTimer: 0,
+              frame: i % 6,
+              coinValue: GOLD_COIN_VALUE,
+              age: 0
+          });
+      }
+  };
+
+  /** Banks a coin: score, counter, and a free life every COINS_PER_LIFE coins. */
+  const addCoin = (value: number, x: number, y: number) => {
+      stateRef.current.coins++;
+      addScore(value);
+      audio.coin();
+      spawnScore(x, y, `+${value}`);
+      if (stateRef.current.coins % COINS_PER_LIFE === 0) {
+          stateRef.current.lives++;
+          audio.oneUp();
+          spawnScore(x, y - 24, "1 UP!");
+      }
   };
 
   const update = () => {
@@ -448,6 +644,25 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
             if (player.starTimer <= 0) player.starTimer = 0;
         }
 
+        // --- Power-up timers ---
+        if (player.abilityTimer && player.abilityTimer > 0) {
+            player.abilityTimer -= 16;
+            if (player.abilityTimer <= 0) {
+                player.abilityTimer = 0;
+                expireAbility(player);
+            }
+        }
+        if (stateRef.current.buffs.slowmo) {
+            stateRef.current.buffs.slowmo -= 16;
+            if (stateRef.current.buffs.slowmo <= 0) delete stateRef.current.buffs.slowmo;
+        }
+        if (player.megaTimer && player.megaTimer > 0) {
+            player.megaTimer -= 16;
+            if (player.megaTimer <= 0) endMegaForm(player);
+        }
+
+        const upHeld = !!(keysRef.current['ArrowUp'] || keysRef.current['KeyW']);
+
         const isRunning = keysRef.current['ShiftLeft'] || keysRef.current['ShiftRight'] || keysRef.current['KeyX'];
         const maxSpd = isRunning ? MAX_RUN_SPEED : MAX_SPEED;
         const accel = isRunning ? RUN_ACCEL : MOVE_ACCEL;
@@ -480,25 +695,59 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
         player.vel.y += GRAVITY;
         player.vel.y = Math.min(player.vel.y, 12); 
 
-        if (!keysRef.current['ArrowUp'] && !keysRef.current['KeyW']) {
+        // Jetpack: holding up fires the thruster while there is fuel left.
+        const thrusting = player.ability === 'jetpack' && upHeld && (player.fuel ?? 0) > 0;
+        if (thrusting) {
+            player.vel.y = -JETPACK_THRUST;
+            player.fuel = Math.max(0, (player.fuel ?? 0) - JETPACK_FUEL_BURN);
+            player.animTimer += 0.2;
+            if (player.animTimer % 0.6 < 0.2) {
+                spawnParticle(player.pos.x + player.width / 2, player.pos.y + player.height, '#fb923c', 1);
+            }
+            if (player.animTimer % 0.3 < 0.1) audio.jet();
+        } else if (player.ability === 'jetpack') {
+            player.fuel = Math.min(JETPACK_FUEL_MAX, (player.fuel ?? 0) + JETPACK_FUEL_REFILL);
+        }
+
+        if (!upHeld) {
            if (player.vel.y < -4) player.vel.y *= 0.5;
         }
 
+        const wasGrounded = player.grounded;
+        const fallSpeed = player.vel.y;
         player.pos.y += player.vel.y;
         const isGrounded = checkTileCollisionY(player);
         player.grounded = isGrounded;
 
         if (isGrounded) {
            lastSafePosRef.current = { x: player.pos.x, y: player.pos.y };
+           player.jumpsLeft = player.ability === 'tanooki' ? 1 : 0;
+           stateRef.current.combo = 0; // the combo chain only counts airborne kills
+
+           // Spring: landing hard bounces the player straight back up.
+           if (player.ability === 'spring' && !wasGrounded && fallSpeed >= SPRING_BOUNCE_MIN_FALL) {
+              player.vel.y = SPRING_BOUNCE;
+              player.grounded = false;
+              audio.jump();
+              spawnParticle(player.pos.x + player.width / 2, player.pos.y + player.height, '#22d3ee', 4);
+           }
         }
 
-        if (isGrounded && (keysRef.current['ArrowUp'] || keysRef.current['KeyW'])) {
-          if (!keysRef.current['jumpLock']) {
-             player.vel.y = JUMP_FORCE; 
+        if (upHeld) {
+          if (isGrounded && !keysRef.current['jumpLock']) {
+             player.vel.y = player.ability === 'spring' ? SPRING_JUMP_FORCE : JUMP_FORCE; 
              keysRef.current['jumpLock'] = true;
+             audio.jump();
+          } else if (!isGrounded && !keysRef.current['jumpLock'] && player.ability === 'tanooki' && (player.jumpsLeft ?? 0) > 0) {
+             // Tanooki suit: one extra jump in mid air.
+             player.jumpsLeft = (player.jumpsLeft ?? 0) - 1;
+             player.vel.y = TANOOKI_JUMP_FORCE;
+             keysRef.current['jumpLock'] = true;
+             audio.doubleJump();
+             spawnParticle(player.pos.x + player.width / 2, player.pos.y + player.height, '#fbbf24', 4);
           }
         }
-        if (!keysRef.current['ArrowUp'] && !keysRef.current['KeyW']) {
+        if (!upHeld) {
            keysRef.current['jumpLock'] = false;
         }
 
@@ -507,6 +756,13 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
             handlePitFall();
         }
     }
+
+    // Mirror the player's power-up state into the HUD state.
+    stateRef.current.ability = player.ability ?? null;
+    stateRef.current.abilityTimer = player.abilityTimer ?? 0;
+    stateRef.current.fuel = player.fuel ?? 0;
+    stateRef.current.megaTimer = player.megaTimer ?? 0;
+    stateRef.current.starTimer = player.starTimer ?? 0;
 
     // --- Camera ---
     const targetCamX = Math.max(0, player.pos.x - SCREEN_WIDTH * 0.35); 
@@ -535,6 +791,7 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
              killEntity(ent, true);
              spawnParticle(ent.pos.x, ent.pos.y, '#bae6fd', 8); // Ice shatter
              spawnScore(ent.pos.x, ent.pos.y, "SMASH!");
+             audio.freeze();
           }
           return; 
       }
@@ -571,18 +828,72 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
           return; 
       }
 
+      // Boomerang Logic: flies out, flattens what it hits, then comes home.
+      if (ent.type === 'boomerang') {
+          ent.animTimer += 0.3;
+          ent.age = (ent.age ?? 0) + 1;
+
+          if (ent.returning) {
+              const dx = (player.pos.x + player.width / 2) - (ent.pos.x + ent.width / 2);
+              const dy = (player.pos.y + player.height / 2) - (ent.pos.y + ent.height / 2);
+              const dist = Math.hypot(dx, dy) || 1;
+              ent.vel.x = (dx / dist) * BOOMERANG_SPEED;
+              ent.vel.y = (dy / dist) * BOOMERANG_SPEED;
+              if (dist < 20) ent.isDead = true;
+          } else {
+              ent.vel.y = Math.sin(ent.animTimer) * 2;
+              if ((ent.age ?? 0) * BOOMERANG_SPEED > BOOMERANG_RANGE) {
+                  ent.returning = true;
+                  ent.vel.x = -Math.sign(ent.vel.x) * BOOMERANG_SPEED;
+              }
+          }
+
+          ent.pos.x += ent.vel.x;
+          ent.pos.y += ent.vel.y;
+
+          entitiesRef.current.forEach(other => {
+              if (other === ent || other.isDead || !ENEMY_TYPES[other.type]) return;
+              if (checkRectCollide(ent, other)) {
+                  killEntity(other, true);
+                  spawnScore(other.pos.x, other.pos.y, "BOOM!");
+              }
+          });
+          return;
+      }
+
+      // Magnet: coins and items nearby are dragged towards the player.
+      if (player.ability === 'magnet' && (ent.type === 'coin' || COLLECTIBLE_TYPES[ent.type])) {
+          const dx = (player.pos.x + player.width / 2) - (ent.pos.x + ent.width / 2);
+          const dy = (player.pos.y + player.height / 2) - (ent.pos.y + ent.height / 2);
+          const dist = Math.hypot(dx, dy);
+          if (dist < MAGNET_RADIUS && dist > 1) {
+              ent.vel.x = (dx / dist) * MAGNET_PULL;
+              ent.vel.y = (dy / dist) * MAGNET_PULL;
+              ent.pos.x += ent.vel.x;
+              ent.pos.y += ent.vel.y;
+              ent.animTimer += 0.1;
+
+              if (!stateRef.current.won && checkRectCollide(player, ent)) {
+                  handlePlayerEntityCollision(player, ent, now);
+              }
+              return;
+          }
+      }
+
+      // Slow motion holds the enemies back but leaves the player at full speed.
+      const timeScale = ENEMY_TYPES[ent.type] && stateRef.current.buffs.slowmo ? SLOWMO_FACTOR : 1;
       // Physics for normal entities
-      ent.vel.y += GRAVITY;
+      ent.vel.y += GRAVITY * timeScale;
       ent.vel.y = Math.min(ent.vel.y, 10);
 
       // Horizontal
-      ent.pos.x += ent.vel.x;
+      ent.pos.x += ent.vel.x * timeScale;
       const colX = checkTileCollisionX(ent);
       if (colX) {
          if (ent.type === 'fireball' || ent.type === 'iceball') {
             ent.isDead = true;
             spawnParticle(ent.pos.x, ent.pos.y, ent.type === 'iceball' ? '#bae6fd' : '#f59e0b', 4);
-         } else if (['goomba', 'big_goomba', 'koopa', 'koopa_red', 'spiny', 'mushroom', '1up', 'flower', 'ice_flower', 'star'].includes(ent.type) && ent.state !== 'shell_moving') {
+         } else if ((ENEMY_TYPES[ent.type] || MOVER_ITEMS.includes(ent.type)) && ent.state !== 'shell_moving') {
             ent.vel.x *= -1;
             ent.facing = ent.vel.x > 0 ? 1 : -1;
          } else if (ent.type.includes('koopa') && ent.state === 'shell_moving') {
@@ -607,7 +918,7 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
       }
 
       // Vertical
-      ent.pos.y += ent.vel.y;
+      ent.pos.y += ent.vel.y * timeScale;
       const gr = checkTileCollisionY(ent);
       ent.grounded = gr;
 
@@ -615,15 +926,14 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
           ent.vel.y = -5; // Bounce
       }
 
-      if (gr && (ent.type === 'mushroom' || ent.type === '1up' || ent.type === 'star' || ent.type.includes('flower'))) {
-      } else if (gr && ent.state === 'shell') {
+      if (gr && ent.state === 'shell') {
            ent.vel.x *= 0.9;
       }
 
       ent.animTimer += 0.1;
       if (ent.animTimer > 1) {
          ent.animTimer = 0;
-         ent.frame = (ent.frame! + 1) % 2;
+         ent.frame = (ent.frame! + 1) % (ent.type === 'coin' ? 6 : 2);
       }
 
       // Interaction with Player
@@ -634,12 +944,13 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
       }
 
       // Interaction with Projectiles
-      if (['goomba', 'big_goomba', 'koopa', 'koopa_red', 'spiny'].includes(ent.type)) {
+      if (ENEMY_TYPES[ent.type]) {
           entitiesRef.current.forEach(other => {
               if ((other.type === 'fireball' || other.type === 'iceball') && !other.isDead && checkRectCollide(ent, other)) {
                    if (other.type === 'iceball') {
                        ent.frozenTimer = 300; 
                        spawnScore(ent.pos.x, ent.pos.y, "FREEZE!");
+                       audio.freeze();
                    } else {
                        killEntity(ent, true);
                    }
@@ -692,7 +1003,8 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
       
       // Calculate bonus
       const timeBonus = Math.floor(stateRef.current.time / 10) * 100;
-      stateRef.current.score += timeBonus;
+      addScore(timeBonus);
+      audio.levelClear();
       setTimeout(() => {
           spawnScore(playerRef.current.pos.x, playerRef.current.pos.y - 60, `TIME BONUS: ${timeBonus}`);
       }, 1000);
@@ -720,35 +1032,102 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
      // Items
      if (e.type === 'mushroom') {
         e.isDead = true;
-        if (p.state === 'small') {
-            p.state = 'big';
-            p.width = 24; p.height = 50; 
-            p.pos.y -= 20;
-        }
-        stateRef.current.score += 1000;
+        if (p.state === 'small') setPlayerForm(p, 'big');
+        addScore(1000);
         spawnScore(e.pos.x, e.pos.y, "1000");
+        audio.powerup();
         return;
      }
      if (e.type === '1up') {
         e.isDead = true;
         stateRef.current.lives++;
-        stateRef.current.score += 500;
+        addScore(500);
         spawnScore(e.pos.x, e.pos.y, "+1 UP");
+        audio.oneUp();
         return;
      }
      if (e.type === 'flower' || e.type === 'ice_flower') {
         e.isDead = true;
-        p.state = e.type === 'flower' ? 'fire' : 'ice';
-        p.width = 24; p.height = 50;
-        stateRef.current.score += 1000;
+        if (p.state !== 'mega') setPlayerForm(p, e.type === 'flower' ? 'fire' : 'ice');
+        addScore(1000);
         spawnScore(e.pos.x, e.pos.y, e.type === 'flower' ? "FIRE!" : "ICE!");
+        audio.powerup();
         return;
      }
      if (e.type === 'star') {
         e.isDead = true;
         p.starTimer = 10000; 
-        stateRef.current.score += 1000;
+        addScore(1000);
         spawnScore(e.pos.x, e.pos.y, "STAR!");
+        audio.powerup();
+        return;
+     }
+     if (e.type === 'tanooki') {
+        e.isDead = true;
+        grantAbility(p, 'tanooki');
+        addScore(1000);
+        spawnScore(e.pos.x, e.pos.y, "TANOOKI!");
+        audio.powerup();
+        return;
+     }
+     if (e.type === 'boomerang_flower') {
+        e.isDead = true;
+        grantAbility(p, 'boomerang');
+        addScore(1000);
+        spawnScore(e.pos.x, e.pos.y, "BOOMERANG!");
+        audio.powerup();
+        return;
+     }
+     if (e.type === 'jetpack') {
+        e.isDead = true;
+        grantAbility(p, 'jetpack');
+        addScore(1000);
+        spawnScore(e.pos.x, e.pos.y, "JETPACK!");
+        audio.powerup();
+        return;
+     }
+     if (e.type === 'magnet') {
+        e.isDead = true;
+        grantAbility(p, 'magnet');
+        addScore(1000);
+        spawnScore(e.pos.x, e.pos.y, "MAGNET!");
+        audio.magnet();
+        return;
+     }
+     if (e.type === 'hourglass') {
+        e.isDead = true;
+        grantAbility(p, 'slowmo');
+        addScore(1000);
+        spawnScore(e.pos.x, e.pos.y, "SLOW-MO!");
+        audio.slowmo();
+        return;
+     }
+     if (e.type === 'spring') {
+        e.isDead = true;
+        grantAbility(p, 'spring');
+        addScore(1000);
+        spawnScore(e.pos.x, e.pos.y, "SPRING!");
+        audio.powerup();
+        return;
+     }
+     if (e.type === 'gold_mushroom') {
+        e.isDead = true;
+        addScore(GOLD_MUSHROOM_SCORE);
+        spawnScore(e.pos.x, e.pos.y, `${GOLD_MUSHROOM_SCORE}`);
+        spawnCoinShower(p.pos.x + p.width / 2, p.pos.y);
+        audio.powerup();
+        return;
+     }
+     if (e.type === 'mega_mushroom') {
+        e.isDead = true;
+        startMegaForm(p);
+        addScore(1000);
+        spawnScore(e.pos.x, e.pos.y, "MEGA!");
+        return;
+     }
+     if (e.type === 'coin') {
+        e.isDead = true;
+        addCoin(e.coinValue ?? 100, e.pos.x, e.pos.y);
         return;
      }
 
@@ -781,7 +1160,8 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
                  e.vel.x = centerP < centerE ? 6 : -6;
                  e.pos.x += e.vel.x; 
                  p.vel.y = -6; 
-                 spawnScore(e.pos.x, e.pos.y, "KICK");
+                spawnScore(e.pos.x, e.pos.y, "KICK");
+                audio.kick();
              } else {
                  e.state = 'shell';
                  e.vel.x = 0;
@@ -791,7 +1171,21 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
                  spawnScore(e.pos.x, e.pos.y, "100");
              }
         } else {
-            killEntity(e, false);
+            // Stomp: a chain of airborne kills keeps paying out, and the last
+            // link of the chain turns into a free life.
+            e.isDead = true;
+            stateRef.current.combo++;
+            const chainPoints = STOMP_CHAIN[Math.min(stateRef.current.combo, STOMP_CHAIN.length) - 1] ?? 100;
+            addScore(chainPoints);
+            spawnScore(e.pos.x, e.pos.y, `${chainPoints}`);
+            audio.stomp();
+            audio.combo(stateRef.current.combo);
+            if (stateRef.current.combo >= STOMP_CHAIN.length) {
+                stateRef.current.combo = 0;
+                stateRef.current.lives++;
+                audio.oneUp();
+                spawnScore(e.pos.x, e.pos.y - 24, "1 UP!");
+            }
             p.vel.y = BOUNCE_FORCE;
         }
      } else {
@@ -806,13 +1200,20 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
              return;
         }
 
-        if (p.state === 'fire' || p.state === 'big' || p.state === 'ice') {
-            p.state = 'small';
-            p.width = 24; p.height = 32;
+        if (p.state === 'mega') {
+            // The mega form shrugs hits off; the player is only knocked back.
+            p.vel.y = -6;
+            p.vel.x = p.pos.x < e.pos.x ? -6 : 6;
+            p.invulnerableUntil = now + 2000;
+            spawnScore(p.pos.x, p.pos.y, "MEGA!");
+        } else if (p.state === 'fire' || p.state === 'big' || p.state === 'ice') {
+            setPlayerForm(p, 'small');
+            expireAbility(p);
             p.invulnerableUntil = now + 2000;
         } else {
             stateRef.current.lives--;
             spawnScore(p.pos.x, p.pos.y, `-1 HEART`);
+            expireAbility(p);
             if (stateRef.current.lives <= 0) {
                die();
             } else {
@@ -826,10 +1227,8 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
 
   const killEntity = (e: Entity, kicked: boolean) => {
      e.isDead = true;
-     stateRef.current.lives++;
-     stateRef.current.score += 100;
+     addScore(100);
      spawnScore(e.pos.x, e.pos.y, "100");
-     spawnScore(e.pos.x, e.pos.y - 20, "+1 ♥");
      if (kicked) {
          spawnParticle(e.pos.x, e.pos.y, '#b83800', 4);
      }
@@ -895,35 +1294,36 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
     if (Math.abs((playerRef.current.pos.x + playerRef.current.width/2) - (tile.x + TILE_SIZE/2)) > 20) return;
 
     tile.bumpOffset = -10; 
+    audio.blockBump();
 
     if (tile.type === 'question') {
        tile.hit = true;
-       if (tile.content === 'coin') {
-          stateRef.current.coins++;
-          stateRef.current.score += 200;
-          spawnScore(tile.x, tile.y - 20, "200");
-          spawnParticle(tile.x + 8, tile.y - 32, '#fbbf24');
-       } else if (tile.content) {
+      if (tile.content === 'coin') {
+         addCoin(200, tile.x, tile.y - 20);
+         spawnParticle(tile.x + 8, tile.y - 32, '#fbbf24');
+      } else if (tile.content) {
           spawnItem(tile.content, tile.x, tile.y - 32);
        }
     } else if (tile.type === 'brick') {
        const p = playerRef.current;
-       if (p.state === 'big' || p.state === 'fire' || p.state === 'ice') {
+      if (p.state === 'big' || p.state === 'fire' || p.state === 'ice' || p.state === 'mega') {
           tile.type = 'empty'; 
           tile.solid = false;
           tile.x = -9999; 
           spawnParticle(tile.x, tile.y, '#b45309', 4);
-          stateRef.current.score += 50;
+          addScore(50);
        } 
     }
   };
 
   const spawnItem = (type: Entity['type'], x: number, y: number) => {
+     // Flowers sit on their block, everything else walks off it.
+     const isStatic = STATIC_ITEMS.includes(type);
      entitiesRef.current.push({
         id: `item_${Date.now()}`,
         type,
         pos: {x, y},
-        vel: {x: (type === 'flower' || type === 'ice_flower') ? 0 : 2, y: 0},
+        vel: {x: isStatic ? 0 : 2, y: 0},
         width: 30, height: 30,
         state: 'moving',
         facing: 1,
@@ -963,6 +1363,7 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
 
   const die = () => {
     stateRef.current.gameOver = true;
+    audio.die();
     onGameOver(stateRef.current.score);
   };
 
@@ -1155,6 +1556,9 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
       } else if (p.state === 'ice') {
           shirtColor = '#bae6fd'; // Light Blue/Cyan
           overallColor = '#1e3a8a'; // Dark Blue
+      } else if (p.state === 'mega') {
+          shirtColor = '#facc15'; // Gold
+          overallColor = '#a855f7'; // Purple
       }
 
       if (p.starTimer && p.starTimer > 0) {
@@ -1162,6 +1566,36 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
           shirtColor = `hsl(${hue}, 80%, 60%)`;
           overallColor = `hsl(${(hue + 180) % 360}, 80%, 60%)`;
           skinColor = `hsl(${(hue + 90) % 360}, 80%, 80%)`;
+      }
+
+      // Mega form: golden aura around the player.
+      if (p.state === 'mega') {
+          const glow = ctx.createRadialGradient(0, -26, 4, 0, -26, 32);
+          glow.addColorStop(0, 'rgba(250, 204, 21, 0.5)');
+          glow.addColorStop(1, 'rgba(250, 204, 21, 0)');
+          ctx.fillStyle = glow;
+          ctx.beginPath(); ctx.arc(0, -26, 32, 0, Math.PI * 2); ctx.fill();
+      }
+
+      // Magnet: a pulsing ring marks the pull radius.
+      if (p.ability === 'magnet') {
+          const pulse = 30 + Math.sin(Date.now() / 90) * 4;
+          ctx.strokeStyle = 'rgba(220, 38, 38, 0.5)';
+          ctx.lineWidth = 3;
+          ctx.beginPath(); ctx.arc(0, -22, pulse, 0, Math.PI * 2); ctx.stroke();
+      }
+
+      // Jetpack: thruster flame while the pack is burning.
+      if (p.ability === 'jetpack' && (p.fuel ?? 0) > 0 && !p.grounded) {
+          const flicker = 7 + Math.sin(Date.now() / 40) * 3;
+          ctx.fillStyle = '#fb923c';
+          ctx.beginPath();
+          ctx.moveTo(-5, 0); ctx.lineTo(5, 0); ctx.lineTo(0, flicker);
+          ctx.closePath(); ctx.fill();
+          ctx.fillStyle = '#fef08a';
+          ctx.beginPath();
+          ctx.moveTo(-2.5, 0); ctx.lineTo(2.5, 0); ctx.lineTo(0, flicker * 0.6);
+          ctx.closePath(); ctx.fill();
       }
 
       const walk = Math.sin(p.animTimer * Math.PI * 2);
@@ -1189,7 +1623,7 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
       ctx.beginPath(); ctx.arc(5, -22, 2, 0, Math.PI*2); ctx.fill();
 
       // Head
-      const isBig = p.state === 'big' || p.state === 'fire' || p.state === 'ice';
+      const isBig = p.state === 'big' || p.state === 'fire' || p.state === 'ice' || p.state === 'mega';
       const headScale = isBig ? 1.2 : 1;
       
       ctx.translate(0, -28);
@@ -1388,78 +1822,20 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
              ctx.beginPath(); ctx.arc(6, -11, 1.5, 0, Math.PI*2); ctx.fill();
          }
          ctx.restore();
-     } else if (e.type === 'mushroom' || e.type === '1up') {
-         ctx.save();
-         ctx.translate(x + w/2, y + h);
-         ctx.fillStyle = '#fef08a';
-         ctx.fillRect(-6, -10, 12, 10);
-         ctx.fillStyle = e.type === '1up' ? '#22c55e' : '#ef4444'; // Green or Red
-         ctx.beginPath(); ctx.arc(0, -10, 14, Math.PI, 0); ctx.fill();
-         ctx.fillStyle = '#fff';
-         ctx.beginPath(); ctx.arc(0, -16, 4, 0, Math.PI*2); ctx.fill();
-         ctx.beginPath(); ctx.arc(-10, -12, 3, 0, Math.PI*2); ctx.fill();
-         ctx.beginPath(); ctx.arc(10, -12, 3, 0, Math.PI*2); ctx.fill();
-         ctx.restore();
-     } else if (e.type === 'flower' || e.type === 'ice_flower') {
-         ctx.save();
-         ctx.translate(x + w/2, y + h);
-         ctx.fillStyle = '#16a34a'; // Stem
-         ctx.fillRect(-2, -10, 4, 10);
-         // Leaves
-         ctx.beginPath(); ctx.ellipse(-6, -4, 6, 3, 0, 0, Math.PI*2); ctx.fill();
-         ctx.beginPath(); ctx.ellipse(6, -4, 6, 3, 0, 0, Math.PI*2); ctx.fill();
-         // Head
-         ctx.fillStyle = e.type === 'ice_flower' ? '#3b82f6' : '#ef4444'; // Blue or Red
-         ctx.beginPath(); ctx.ellipse(0, -14, 10, 6, 0, 0, Math.PI*2); ctx.fill();
-         ctx.fillStyle = e.type === 'ice_flower' ? '#dbeafe' : '#facc15'; // Light blue or Yellow Center
-         ctx.beginPath(); ctx.ellipse(0, -14, 5, 3, 0, 0, Math.PI*2); ctx.fill();
-         ctx.restore();
-     } else if (e.type === 'star') {
-         ctx.save();
-         ctx.translate(x + w/2, y + h/2);
-         // Rainbow
-         const hue = (Date.now() / 2) % 360;
-         ctx.fillStyle = `hsl(${hue}, 80%, 60%)`;
-         const spikes = 5;
-         const outerRadius = 14;
-         const innerRadius = 7;
-         ctx.beginPath();
-         let rot = Math.PI / 2 * 3;
-         let xS = 0, yS = 0;
-         const step = Math.PI / spikes;
-         ctx.moveTo(0, 0 - outerRadius);
-         for (let i = 0; i < spikes; i++) {
-            xS = 0 + Math.cos(rot) * outerRadius;
-            yS = 0 + Math.sin(rot) * outerRadius;
-            ctx.lineTo(xS, yS);
-            rot += step;
-            xS = 0 + Math.cos(rot) * innerRadius;
-            yS = 0 + Math.sin(rot) * innerRadius;
-            ctx.lineTo(xS, yS);
-            rot += step;
-         }
-         ctx.lineTo(0, 0 - outerRadius);
-         ctx.closePath();
-         ctx.fill();
-         // Eyes
-         ctx.fillStyle = '#000';
-         ctx.fillRect(-4, -2, 2, 4);
-         ctx.fillRect(2, -2, 2, 4);
-         ctx.restore();
-     } else if (e.type === 'fireball' || e.type === 'iceball') {
-         ctx.save();
-         ctx.translate(x + w/2, y + h/2);
-         ctx.rotate(e.animTimer * 20);
-         const c1 = e.type === 'iceball' ? '#dbeafe' : '#fef08a';
-         const c2 = e.type === 'iceball' ? '#3b82f6' : '#ef4444';
-         const grad = ctx.createRadialGradient(0,0,2,0,0,8);
-         grad.addColorStop(0, c1);
-         grad.addColorStop(0.5, c2);
-         grad.addColorStop(1, 'rgba(0,0,0,0)');
-         ctx.fillStyle = grad;
-         ctx.beginPath(); ctx.arc(0,0,8,0,Math.PI*2); ctx.fill();
-         ctx.restore();
      }
+  };
+
+  /** Items, coins and projectiles come straight from the sprite cache. */
+  const drawItem = (ctx: CanvasRenderingContext2D, e: Entity) => {
+      const frame = e.type === 'star' ? (Date.now() / 40) % 12 : (e.frame ?? 0);
+      const s = itemSprite(e.type, frame);
+      if (!s) return;
+
+      ctx.save();
+      ctx.translate(e.pos.x + e.width / 2, e.pos.y + e.height / 2);
+      if (e.type === 'boomerang') ctx.rotate(e.animTimer * 6);
+      ctx.drawImage(s.canvas, -s.w / 2, -s.h / 2);
+      ctx.restore();
   };
 
   const draw = () => {
@@ -1493,10 +1869,19 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
 
     entitiesRef.current.forEach(ent => {
        if (ent.pos.x < stateRef.current.cameraX - 100 || ent.pos.x > stateRef.current.cameraX + SCREEN_WIDTH + 100) return;
-       if (ent.type !== 'piranha_plant') drawEnemy(ctx, ent);
+      if (ent.type !== 'piranha_plant') {
+          if (SPRITE_TYPES[ent.type]) drawItem(ctx, ent);
+          else drawEnemy(ctx, ent);
+      }
     });
 
     if (!playerRef.current.isDead) drawPlayer(ctx, playerRef.current);
+
+    // Slow motion tints the whole world.
+    if (stateRef.current.buffs.slowmo) {
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.16)';
+        ctx.fillRect(stateRef.current.cameraX, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    }
 
     particlesRef.current.forEach(p => {
        if (p.type === 'score_text') {
@@ -1532,6 +1917,7 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
         <div className="flex flex-col bg-white/80 backdrop-blur-sm px-4 py-2 rounded-2xl shadow-sm">
            <span className="text-[10px] text-slate-500 font-bold tracking-widest uppercase mb-1">Score</span>
            <span className="font-black text-2xl tracking-tighter text-blue-600">{uiState.score.toLocaleString()}</span>
+           <span className="text-xs font-bold text-amber-500 mt-1">🪙 {uiState.coins}<span className="text-slate-400"> / {COINS_PER_LIFE}</span></span>
         </div>
         <div className="flex flex-col items-center bg-white/80 backdrop-blur-sm px-4 py-2 rounded-2xl shadow-sm">
            <span className="text-[10px] text-slate-500 font-bold tracking-widest uppercase mb-1">Lives</span>
@@ -1545,8 +1931,50 @@ const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(({ onGameOver, 
         <div className="flex flex-col items-end bg-white/80 backdrop-blur-sm px-4 py-2 rounded-2xl shadow-sm">
            <span className="text-[10px] text-slate-500 font-bold tracking-widest uppercase mb-1">World</span>
            <span className="font-black text-2xl text-yellow-500">{uiState.world}</span>
+           {uiState.muted && <span className="text-[10px] font-bold text-slate-400">MUTED (M)</span>}
         </div>
       </div>
+
+      {(uiState.ability || uiState.megaTimer > 0 || uiState.combo > 0) && (
+        <div className="absolute top-28 left-4 z-10 flex flex-col gap-2 text-slate-800 font-sans select-none">
+          {uiState.ability && (
+            <div className="bg-white/80 backdrop-blur-sm px-4 py-2 rounded-2xl shadow-sm">
+              <span className="text-[10px] text-slate-500 font-bold tracking-widest uppercase block">Power-up</span>
+              <div className="flex items-baseline gap-2">
+                <span className="font-black text-lg text-purple-600">{ABILITY_LABELS[uiState.ability] ?? uiState.ability}</span>
+                {uiState.abilityTimer > 0 && (
+                  <span className="text-xs font-bold text-slate-500">{(uiState.abilityTimer / 1000).toFixed(1)}s</span>
+                )}
+              </div>
+              {uiState.abilityTimer > 0 && (
+                <div className="h-1.5 w-32 bg-slate-200 rounded-full mt-1 overflow-hidden">
+                  <div
+                    className="h-full bg-purple-500"
+                    style={{ width: `${Math.min(100, (uiState.abilityTimer / (ABILITY_DURATIONS[uiState.ability] || 1)) * 100)}%` }}
+                  />
+                </div>
+              )}
+              {uiState.ability === 'jetpack' && (
+                <div className="h-1.5 w-32 bg-slate-200 rounded-full mt-1 overflow-hidden">
+                  <div className="h-full bg-orange-500" style={{ width: `${uiState.fuel}%` }} />
+                </div>
+              )}
+            </div>
+          )}
+          {uiState.megaTimer > 0 && (
+            <div className="bg-white/80 backdrop-blur-sm px-4 py-2 rounded-2xl shadow-sm">
+              <span className="text-[10px] text-slate-500 font-bold tracking-widest uppercase block">Mega</span>
+              <span className="font-black text-lg text-yellow-500">{(uiState.megaTimer / 1000).toFixed(1)}s</span>
+            </div>
+          )}
+          {uiState.combo > 0 && (
+            <div className="bg-white/80 backdrop-blur-sm px-4 py-2 rounded-2xl shadow-sm">
+              <span className="text-[10px] text-slate-500 font-bold tracking-widest uppercase block">Combo</span>
+              <span className="font-black text-lg text-emerald-500">x{uiState.combo}</span>
+            </div>
+          )}
+        </div>
+      )}
       
       {uiState.gameOver && (
         <div className="absolute inset-0 bg-slate-900/80 flex items-center justify-center z-20 flex-col animate-in fade-in duration-500 backdrop-blur-md">

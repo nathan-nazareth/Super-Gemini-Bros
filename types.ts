@@ -3,9 +3,58 @@ export interface Vector {
   y: number;
 }
 
+/** Every item that can live inside a ? block or bounce out of one. */
+export type PowerUpId =
+  | 'mushroom'
+  | '1up'
+  | 'flower'
+  | 'ice_flower'
+  | 'star'
+  | 'tanooki'
+  | 'boomerang_flower'
+  | 'jetpack'
+  | 'magnet'
+  | 'hourglass'
+  | 'spring'
+  | 'gold_mushroom'
+  | 'mega_mushroom';
+
+/** Active player abilities. `slowmo` is a timed world effect, the rest are carried. */
+export type PlayerAbility = 'tanooki' | 'boomerang' | 'jetpack' | 'magnet' | 'slowmo' | 'spring';
+
+export type EntityType =
+  | 'player'
+  | 'goomba'
+  | 'big_goomba'
+  | 'koopa'
+  | 'koopa_red'
+  | 'spiny'
+  | 'mushroom'
+  | '1up'
+  | 'flower'
+  | 'ice_flower'
+  | 'star'
+  | 'tanooki'
+  | 'boomerang_flower'
+  | 'jetpack'
+  | 'magnet'
+  | 'hourglass'
+  | 'spring'
+  | 'gold_mushroom'
+  | 'mega_mushroom'
+  | 'particle'
+  | 'score_text'
+  | 'fireball'
+  | 'iceball'
+  | 'boomerang'
+  | 'bullet_bill'
+  | 'piranha_plant'
+  | 'bee'
+  | 'coin';
+
 export interface Entity {
   id: string;
-  type: 'player' | 'goomba' | 'big_goomba' | 'koopa' | 'koopa_red' | 'spiny' | 'mushroom' | '1up' | 'flower' | 'ice_flower' | 'star' | 'particle' | 'score_text' | 'fireball' | 'iceball' | 'bullet_bill' | 'piranha_plant';
+  type: EntityType;
   pos: Vector;
   vel: Vector;
   width: number;
@@ -21,16 +70,29 @@ export interface Entity {
   invulnerableUntil?: number; // Timestamp for damage iframe
   starTimer?: number; // Timestamp until star power ends
   frozenTimer?: number; // Timestamp for being frozen
+  ability?: PlayerAbility | null; // Carried ability (player)
+  abilityTimer?: number; // ms left on a timed ability (0 = until damaged)
+  fuel?: number; // Jetpack fuel, 0..100
+  jumpsLeft?: number; // Extra jumps left (tanooki double jump)
+  megaTimer?: number; // ms of mega form left
+  age?: number; // Frames alive
+  baseY?: number; // Hover anchor (bee)
+  amp?: number; // Hover amplitude (bee)
+  returning?: boolean; // Boomerang phase
+  coinValue?: number; // Points a coin is worth
+  buffs?: Record<string, number>; // Timed powers (jetpack/magnet/slowmo/spring) in ms
+  prevState?: string; // Form to fall back to when mega wears off
 }
 
 export interface Tile {
   x: number;
   y: number;
-  type: 'ground' | 'brick' | 'question' | 'pipe_l' | 'pipe_r' | 'pipe_top_l' | 'pipe_top_r' | 'hard' | 'flagpole' | 'flagpole_top' | 'castle_brick' | 'castle_top' | 'castle_door' | 'flagpole_flag' | 'empty';
-  content?: 'coin' | 'mushroom' | '1up' | 'star' | 'flower' | 'ice_flower';
+  type: 'ground' | 'ground_fill' | 'brick' | 'question' | 'pipe_l' | 'pipe_r' | 'pipe_top_l' | 'pipe_top_r' | 'hard' | 'flagpole' | 'flagpole_top' | 'castle_brick' | 'castle_top' | 'castle_door' | 'flagpole_flag' | 'empty';
+  content?: PowerUpId | 'coin';
   hit?: boolean;
   bumpOffset?: number; // For animation when hit
   solid?: boolean;
+  multi?: number; // Remaining coin payouts on a multi-coin brick
 }
 
 export interface GameState {
@@ -44,13 +106,23 @@ export interface GameState {
   paused: boolean;
   cameraX: number;
   won: boolean;
+  combo: number; // Consecutive airborne kills
+  ability: PlayerAbility | null;
+  abilityTimer: number; // ms remaining on the timed ability
+  starTimer: number;
+  megaTimer: number;
+  fuel: number;
+  muted: boolean;
+  hurry: boolean;
+  theme: number;
+  buffs: Record<string, number>; // Active timed powers in ms
 }
 
 // AI Types
-export type AIModelType = 
-  | 'gemini-3-pro-preview' 
-  | 'gemini-3-flash-preview' 
-  | 'gemini-2.5-flash-image' 
+export type AIModelType =
+  | 'gemini-3-pro-preview'
+  | 'gemini-3-flash-preview'
+  | 'gemini-2.5-flash-image'
   | 'gemini-3-pro-image-preview';
 
 export interface ChatMessage {
